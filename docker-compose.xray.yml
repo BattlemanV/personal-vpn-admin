@@ -18,7 +18,9 @@ services:
       - SERVER_HOSTNAME=ams-1-vm-78r1
       - WG_HOST=147.45.169.35
     volumes:
-      - xray-data:/data
+      - xray-test-data:/data
 
 volumes:
-  xray-data:
+  xray-test-data:
+    external: true
+    name: xray-test-data
