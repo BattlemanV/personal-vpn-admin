@@ -55,7 +55,7 @@ if [ ! -f "$XRAY_CONF" ]; then
 
     REALITY_KEYS=$(xray x25519)
     REALITY_PRIVATE=$(echo "$REALITY_KEYS" | grep "PrivateKey" | awk '{print $NF}')
-    REALITY_PUBLIC=$(echo "$REALITY_KEYS" | grep "Password" | awk '{print $NF}')
+    REALITY_PUBLIC=$(echo "$REALITY_KEYS" | grep "PublicKey" | awk '{print $NF}')
     echo "$REALITY_PUBLIC" > "$DATA_DIR/reality_public"
     SHORT_ID=$(openssl rand -hex 4)
 

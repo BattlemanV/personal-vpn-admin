@@ -2172,9 +2172,15 @@ def peer_config(client_id: str, x_api_token: Optional[str] = Header(default=None
     )
 
 @app.get("/peer/{client_id}/qr")
-def peer_qr(client_id: str, x_api_token: Optional[str] = Header(default=None), token: Optional[str] = Query(default=None)):
+def peer_qr(client_id: str, proto: Optional[str] = Query(default=None), x_api_token: Optional[str] = Header(default=None), token: Optional[str] = Query(default=None)):
 
-    config = build_client_config(client_id)
+    if WG_VARIANT == "xray" and proto:
+        links = build_xray_links(client_id)
+        config = links.get(proto, "")
+    else:
+        config = build_client_config(client_id)
+    if not config:
+        raise HTTPException(400, "No config for this protocol")
     img = qrcode.make(config)
     buffer = io.BytesIO()
     img.save(buffer, format="PNG")
@@ -2417,6 +2423,7 @@ def dashboard(x_api_token: Optional[str] = Header(default=None)) -> Dict[str, An
     ]
 
     return {
+        "variant": WG_VARIANT,
         "hostname": _get_hostname(),
         "uptime": get_uptime(),
         "cpu": get_cpu_usage(),
