@@ -244,7 +244,7 @@ function copyText(txt){navigator.clipboard.writeText(txt).then(()=>toast('✓'))
 
 // ── peer actions ──
 function showCreateClient(){showModal(`<h3>${t('newDevice')}</h3><input id="newClientName" placeholder="${t('clientName')}"><div class="modal-actions"><button onclick="closeModal()">${t('cancel')}</button><button class="primary-btn" onclick="createClient()">${t('create2')}</button></div>`)}
-async function createClient(){const name=document.getElementById('newClientName').value.trim();if(!name)return toast(t('invalidName'));if(!/^[\w\s\-.\u0400-\u04FF]+$/.test(name))return toast(t('invalidName'));try{await api('/peer/create',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name})});closeModal();toast(t('created'));await new Promise(r=>setTimeout(r,1500));await refreshAll();showMain(state.currentTab||'home')}catch(e){toast(e.message||t('saveError'))}}
+async function createClient(){const name=document.getElementById('newClientName').value.trim();if(!name)return toast(t('invalidName'));if(!/^[\w\s\-.\u0400-\u04FF]+$/.test(name))return toast(t('invalidName'));try{const j=await(await api('/peer/create',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name})})).json();closeModal();toast(t('created'));state.peers.push({name:j.peer||name,client_id:j.client_id,ip:j.ip,enabled:true,online:false});showMain(state.currentTab||'home');refreshAll()}catch(e){toast(e.message||t('saveError'))}}
 I18N.en.newDevice='New device';I18N.ru.newDevice='Новое устройство'
 I18N.en.created='Created';I18N.ru.created='Создано'
 I18N.zh.mon='一';I18N.tr.mon='Pzt';I18N.fa.mon='دوشنبه';I18N.es.mon='Lun';I18N.hi.mon='सोम'
