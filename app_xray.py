@@ -119,6 +119,10 @@ def sync_xray_config() -> None:
         "log": {"loglevel": "warning"},
         "api": {"tag": "api", "services": ["StatsService", "HandlerService"]},
         "stats": {},
+        "policy": {
+            "levels": {"0": {"statsUserUplink": True, "statsUserDownlink": True}},
+            "system": {"statsInboundUplink": True, "statsInboundDownlink": True},
+        },
         "inbounds": [
             {
                 "port": XRAY_REALITY_PORT, "protocol": "vless",
@@ -237,11 +241,56 @@ def get_online_uuids() -> List[str]:
     _ONLINE_UUIDS_TS = now
     return _ONLINE_UUIDS
 
+_TRAFFIC_CACHE: Dict[str, Dict[str, int]] = {}
+_TRAFFIC_CACHE_TS: float = 0
+
+def get_xray_traffic() -> Dict[str, Dict[str, int]]:
+    global _TRAFFIC_CACHE, _TRAFFIC_CACHE_TS
+    now = time.time()
+    if now - _TRAFFIC_CACHE_TS < 30:
+        return _TRAFFIC_CACHE
+    result: Dict[str, Dict[str, int]] = {}
+    out = try_run_cmd(["xray", "api", "statsquery", "--server", f"127.0.0.1:{XRAY_API_PORT}", "-pattern", "user>>>", "-reset"], timeout=5)
+    if out:
+        try:
+            data = json.loads(out)
+            if isinstance(data, dict):
+                for entry in data.get("stat", []):
+                    name = entry.get("name", "")
+                    value = entry.get("value", 0)
+                    match = re.search(r"user>>>([^>]+)>>>traffic>>>(downlink|uplink)", name)
+                    if match:
+                        email = match.group(1)
+                        direction = match.group(2)
+                        result.setdefault(email, {"downlink": 0, "uplink": 0})
+                        result[email][direction] = int(value)
+            elif isinstance(data, list):
+                for entry in data:
+                    if isinstance(entry, dict):
+                        name = entry.get("name", "")
+                        value = entry.get("value", 0)
+                        match = re.search(r"user>>>([^>]+)>>>traffic>>>(downlink|uplink)", name)
+                        if match:
+                            email = match.group(1)
+                            direction = match.group(2)
+                            result.setdefault(email, {"downlink": 0, "uplink": 0})
+                            result[email][direction] = int(value)
+        except json.JSONDecodeError:
+            pass
+    _TRAFFIC_CACHE = result
+    _TRAFFIC_CACHE_TS = now
+    return result
+
 def _build_peer_entry(client: Dict[str, Any], client_id: str) -> Dict[str, Any]:
     name = client.get("name", client_id)
     address = client.get("address", "")
     uid = client.get("xray_uuid", "")
     online = uid in get_online_uuids()
+    traffic_all = get_xray_traffic()
+    peer_traffic = traffic_all.get(uid, {})
+    dl = peer_traffic.get("downlink", 0)
+    ul = peer_traffic.get("uplink", 0)
+    total = dl + ul
     return {
         "id": client_id[:12],
         "name": name,
@@ -259,12 +308,12 @@ def _build_peer_entry(client: Dict[str, Any], client_id: str) -> Dict[str, Any]:
         "latest_handshake_text": handshake_to_text(int(time.time())) if online else "never",
         "online": online,
         "is_active_now": online,
-        "transfer_rx_bytes": 0, "transfer_tx_bytes": 0, "transfer_total_bytes": 0,
-        "transfer_rx_human": bytes_to_human(0), "transfer_tx_human": bytes_to_human(0),
-        "transfer_total_human": bytes_to_human(0),
-        "today_rx_bytes": 0, "today_tx_bytes": 0, "today_total_bytes": 0,
-        "today_rx_human": bytes_to_human(0), "today_tx_human": bytes_to_human(0),
-        "today_total_human": bytes_to_human(0),
+        "transfer_rx_bytes": ul, "transfer_tx_bytes": dl, "transfer_total_bytes": total,
+        "transfer_rx_human": bytes_to_human(ul), "transfer_tx_human": bytes_to_human(dl),
+        "transfer_total_human": bytes_to_human(total),
+        "today_rx_bytes": ul, "today_tx_bytes": dl, "today_total_bytes": total,
+        "today_rx_human": bytes_to_human(ul), "today_tx_human": bytes_to_human(dl),
+        "today_total_human": bytes_to_human(total),
         "week_rx_bytes": 0, "week_tx_bytes": 0, "week_total_bytes": 0,
         "week_rx_human": bytes_to_human(0), "week_tx_human": bytes_to_human(0),
         "week_total_human": bytes_to_human(0),
@@ -280,7 +329,7 @@ def _build_peer_entry(client: Dict[str, Any], client_id: str) -> Dict[str, Any]:
         "has_preshared_key": False,
         "speed_limited": False,
         "speed_limit_rate": None,
-        "today_total_human": bytes_to_human(0),
+        "today_total_human": bytes_to_human(total),
     }
 
 @asynccontextmanager
