@@ -244,7 +244,7 @@ function copyText(txt){navigator.clipboard.writeText(txt).then(()=>toast('✓'))
 
 // ── peer actions ──
 function showCreateClient(){showModal(`<h3>${t('newDevice')}</h3><input id="newClientName" placeholder="${t('clientName')}"><div class="modal-actions"><button onclick="closeModal()">${t('cancel')}</button><button class="primary-btn" onclick="createClient()">${t('create2')}</button></div>`)}
-async function createClient(){const name=document.getElementById('newClientName').value.trim();if(!name)return toast(t('invalidName'));if(!/^[\w\s\-.\u0400-\u04FF]+$/.test(name))return toast(t('invalidName'));await api('/peer/create',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name})});closeModal();toast(t('created'));await refreshAll();showMain(state.currentTab||'home')}
+async function createClient(){const name=document.getElementById('newClientName').value.trim();if(!name)return toast(t('invalidName'));if(!/^[\w\s\-.\u0400-\u04FF]+$/.test(name))return toast(t('invalidName'));await api('/peer/create',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name})});closeModal();toast(t('created'));await refreshAll();showMain(state.currentTab||'home');setTimeout(()=>showMain(state.currentTab||'home'),500)}
 I18N.en.newDevice='New device';I18N.ru.newDevice='Новое устройство'
 I18N.en.created='Created';I18N.ru.created='Создано'
 I18N.zh.mon='一';I18N.tr.mon='Pzt';I18N.fa.mon='دوشنبه';I18N.es.mon='Lun';I18N.hi.mon='सोम'
@@ -403,7 +403,7 @@ let _sx=0;document.body.addEventListener('touchstart',e=>{_sx=e.touches[0].clien
 // ── pull-to-refresh ──
 let _pullY=0,_pullRefreshing=false;document.body.addEventListener('touchstart',e=>{_pullY=e.touches[0].clientY},{passive:true});document.body.addEventListener('touchmove',e=>{if(_pullRefreshing)return;const dy=e.touches[0].clientY-_pullY;if(dy>50&&document.scrollingElement.scrollTop===0){_pullRefreshing=true;refreshAll();setTimeout(()=>{_pullRefreshing=false},2000)}},{passive:true})
 // ── sw ──
-if('serviceWorker'in navigator)navigator.serviceWorker.register('/sw.js?v='+Date.now())
+if('serviceWorker'in navigator)navigator.serviceWorker.register('/sw.js')
 // ── init (DOM is guaranteed ready since app.js loads at end of body) ──
 document.getElementById('modal')?.addEventListener('click',e=>{if(e.target.id==='modal')closeModal()});applyLang();loadAvatarsFromServer();showMain('home');refreshAll();setInterval(()=>{if(!document.hidden)refreshAll()},5000);const sp=document.getElementById('splash');if(sp){setTimeout(()=>{sp.style.opacity='0';document.querySelector('main').style.opacity='1';document.querySelector('nav').style.opacity='1'},1500);setTimeout(()=>sp.remove(),1800)}
 
