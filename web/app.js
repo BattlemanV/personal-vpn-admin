@@ -17,7 +17,7 @@ function esc(s){return String(s??'').replaceAll('&','&amp;').replaceAll('<','&lt
 function escapeAttr(s){return String(s).replaceAll('&','&amp;').replaceAll("'",'\\\'').replaceAll('"','&quot;').replaceAll('<','&lt;').replaceAll('>','&gt;').replaceAll('`','&#96;').replaceAll('\n','\\n').replaceAll('\r','\\r')}
 function toast(msg){const el=document.getElementById('toast');el.textContent=msg;el.style.display='block';clearTimeout(toast.t);toast.t=setTimeout(()=>el.style.display='none',4000)}
 function tip(msg){const el=document.getElementById('modal'),mc=document.getElementById('modalContent');mc.innerHTML=`<div style="max-width:320px;padding-top:16px"><p style="font-size:16px;line-height:1.5;margin:0">${esc(msg)}</p></div>`;el.showModal();el.onclick=function(e){if(e.target===el){closeModal();el.onclick=null}}}
-function humanBytes(n){n=Number(n)||0;const gb=n/1073741824;if(gb<0.1)return'<0.1 '+t('gbLabel');return gb.toFixed(1)+' '+t('gbLabel')}
+function humanBytes(n){n=Number(n)||0;if(n<0)return'0 B';const u=['B','KB','MB','GB','TB'];let i=0;while(n>=1024&&i<u.length-1){n/=1024;i++}return n.toFixed(i>0?1:0)+' '+u[i]}
 function peerAvatar(p){const n=(p?.name||'').toLowerCase();if(n.includes('уль'))return'👧';if(n.includes('пап')||n.includes('vadim'))return'👨';if(n.includes('мам')||n.includes('lud'))return'👩';if(n.includes('роут')||n.includes('router'))return'📡';if(n.includes('phone')||n.includes('тел'))return'📱';if(n.includes('note')||n.includes('pc')||n.includes('book'))return'💻';return'👤'}
 function statusClass(p){return!p.enabled?'disabled':(p.online?'online':'offline')}
 function ruleFor(p){return state.rules[p.client_id]||{}}

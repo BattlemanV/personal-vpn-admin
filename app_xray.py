@@ -697,6 +697,18 @@ def dashboard(x_api_token: Optional[str] = Header(default=None)) -> Dict[str, An
     online_peers = [{"name": p["name"], "ip": p["ip"], "latest_handshake_text": p["latest_handshake_text"],
                       "transfer_total_human": p["transfer_total_human"], "protected": p["protected"]}
                      for p in peers_list if p["online"]]
+    best = None
+    for p in peers_list:
+        if not p.get("online"): continue
+        bt = int(p.get("today_total_bytes") or 0)
+        if not best or bt > best["today_total_bytes"]:
+            best = {"name": p["name"], "ip": p["ip"], "today_total_bytes": bt,
+                    "today_total_human": p.get("today_total_human", "0 B")}
+    top_user_now = {"active": bool(best), "threshold_mbps": 1.0, "active_peer_count": online_count,
+                     "active_peer_keys": [], "active_peer_threshold_mbps": 0.01, "last_event": {}}
+    if best:
+        top_user_now.update(best)
+        top_user_now["ts"] = int(time.time())
     return {
         "variant": "xray",
         "hostname": _get_hostname(),
@@ -722,9 +734,7 @@ def dashboard(x_api_token: Optional[str] = Header(default=None)) -> Dict[str, An
             "vpn_saved_total_human": bytes_to_human(vpn_saved_total),
             "traffic_warn_bytes": read_settings().get("traffic_warn_gb", 30) * 1024 * 1024 * 1024,
             "timezone": read_settings().get("timezone", "auto"),
-            "top_user_now": {"active": online_count > 0, "threshold_mbps": 1.0, "active_peer_count": online_count,
-                             "active_peer_keys": [], "active_peer_threshold_mbps": 0.01,
-                             "last_event": {}},
+            "top_user_now": top_user_now,
             "online_peers": online_peers,
         },
     }
@@ -740,6 +750,18 @@ def peers(x_api_token: Optional[str] = Header(default=None)) -> Dict[str, Any]:
     ]
     peers_list.sort(key=lambda p: p.get("ip") or "")
     online_count = sum(1 for p in peers_list if p["online"])
+    best = None
+    for p in peers_list:
+        if not p.get("online"): continue
+        bt = int(p.get("today_total_bytes") or 0)
+        if not best or bt > best["today_total_bytes"]:
+            best = {"name": p["name"], "ip": p["ip"], "today_total_bytes": bt,
+                    "today_total_human": p.get("today_total_human", "0 B")}
+    top_user_now = {"active": bool(best), "threshold_mbps": 1.0, "active_peer_count": online_count,
+                     "active_peer_keys": [], "active_peer_threshold_mbps": 0.01, "last_event": {}}
+    if best:
+        top_user_now.update(best)
+        top_user_now["ts"] = int(time.time())
     return {
         "interface": "xray",
         "peers": peers_list,
@@ -749,9 +771,7 @@ def peers(x_api_token: Optional[str] = Header(default=None)) -> Dict[str, Any]:
         "disabled_peer_count": sum(1 for p in peers_list if not p["enabled"]),
         "online_threshold_seconds": 1800,
         "active_peer_count": online_count,
-        "top_user_now": {"active": online_count > 0, "threshold_mbps": 1.0, "active_peer_count": online_count,
-                         "active_peer_keys": [], "active_peer_threshold_mbps": 0.01,
-                         "last_event": {}},
+        "top_user_now": top_user_now,
     }
 
 @app.post("/peer/create")
