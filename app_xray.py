@@ -249,6 +249,7 @@ def get_xray_traffic() -> Dict[str, Dict[str, int]]:
     now = time.time()
     if now - _TRAFFIC_CACHE_TS < 30:
         return _TRAFFIC_CACHE
+    _TRAFFIC_CACHE_TS = now  # блокируем повторные вызовы на 30с даже если xray не готов
     result: Dict[str, Dict[str, int]] = {}
     out = try_run_cmd(["xray", "api", "statsquery", "--server", f"127.0.0.1:{XRAY_API_PORT}", "-pattern", "user>>>"], timeout=5)
     if out:
