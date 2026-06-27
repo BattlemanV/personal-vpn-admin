@@ -54,6 +54,10 @@ def _read_short_id() -> str:
     except (FileNotFoundError, OSError):
         return ""
 
+def sync_xray_config_background() -> None:
+    import threading
+    threading.Thread(target=sync_xray_config, daemon=True).start()
+
 def sync_xray_config() -> None:
     data = read_clients_data()
     clients = data.get("clients", {})
@@ -217,7 +221,7 @@ def build_xray_link(client_id: str, proto: str) -> str:
     raise HTTPException(status_code=400, detail=f"Unknown protocol: {proto}")
 
 def post_restart_xray():
-    sync_xray_config()
+    sync_xray_config_background()
 
 _TRAFFIC_CACHE: Dict[str, Dict[str, int]] = {}
 _TRAFFIC_CACHE_TS: float = 0
@@ -471,6 +475,22 @@ def root() -> Response:
     with open(os.path.join(WEB_DIR, "index.html"), "r", encoding="utf-8") as f:
         return Response(
             content=f.read(), media_type="text/html; charset=utf-8",
+            headers={"Cache-Control": "no-cache, no-store, must-revalidate"},
+        )
+
+@app.get("/sw.js")
+def sw_js() -> Response:
+    with open(os.path.join(WEB_DIR, "sw.js"), "r", encoding="utf-8") as f:
+        return Response(
+            content=f.read(), media_type="application/javascript; charset=utf-8",
+            headers={"Cache-Control": "no-cache, no-store, must-revalidate"},
+        )
+
+@app.get("/manifest.json")
+def manifest_json() -> Response:
+    with open(os.path.join(WEB_DIR, "manifest.json"), "r", encoding="utf-8") as f:
+        return Response(
+            content=f.read(), media_type="application/manifest+json; charset=utf-8",
             headers={"Cache-Control": "no-cache, no-store, must-revalidate"},
         )
 
@@ -801,11 +821,8 @@ def peer_create(
         "enabled": True, "protected": False, "role": "user",
     }
     atomic_json_write(CLIENTS_FILE, data, backup=True)
-    try:
-        sync_xray_config()
-    except Exception as e:
-        print(f"[xray] sync after create: {e}")
     log_activity("create", name, client_id, address, {"backup": backup_path})
+    sync_xray_config_background()
     config_changed(f"peer-created:{name}")
     return {"created": True, "peer": name, "ip": address, "client_id": client_id}
 
@@ -825,11 +842,8 @@ def peer_delete(
     shutil.copy2(CLIENTS_FILE, backup_path)
     data.get("clients", {}).pop(client_id, None)
     atomic_json_write(CLIENTS_FILE, data, backup=True)
-    try:
-        sync_xray_config()
-    except Exception as e:
-        print(f"[xray] sync after delete: {e}")
     log_activity("delete", name, client_id, address, {"backup": backup_path})
+    sync_xray_config_background()
     config_changed(f"peer-deleted:{name}")
     return {"deleted": True, "peer": name, "ip": address, "client_id": client_id, "backup": backup_path}
 
@@ -849,11 +863,8 @@ def peer_disable(
     shutil.copy2(CLIENTS_FILE, backup_path)
     client["enabled"] = False
     atomic_json_write(CLIENTS_FILE, data, backup=True)
-    try:
-        sync_xray_config()
-    except Exception as e:
-        print(f"[xray] sync after disable: {e}")
     log_activity("disable", name, client_id, address, {"backup": backup_path})
+    sync_xray_config_background()
     return {"disabled": True, "peer": name, "ip": address, "client_id": client_id, "backup": backup_path}
 
 @app.post("/peer/{client_id}/enable")
@@ -869,11 +880,8 @@ def peer_enable(
     shutil.copy2(CLIENTS_FILE, backup_path)
     client["enabled"] = True
     atomic_json_write(CLIENTS_FILE, data, backup=True)
-    try:
-        sync_xray_config()
-    except Exception as e:
-        print(f"[xray] sync after enable: {e}")
     log_activity("enable", name, client_id, address, {"backup": backup_path})
+    sync_xray_config_background()
     return {"enabled": True, "peer": name, "ip": address, "client_id": client_id, "backup": backup_path}
 
 @app.post("/peer/{client_id}/name")
