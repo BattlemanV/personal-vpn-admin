@@ -32,6 +32,7 @@ XRAY_WS_PORT = int(os.environ.get("WS_PORT", "8444"))
 XRAY_XHTTP_PORT = int(os.environ.get("XHTTP_PORT", "8445"))
 XRAY_WS_INTERNAL = int(os.environ.get("XRAY_PORT", "8443"))
 XRAY_XHTTP_INTERNAL = 8445
+XRAY_API_PORT = int(os.environ.get("XRAY_API_PORT", "62789"))
 
 REALITY_PUBLIC_KEY_FILE = os.path.join(APP_DIR, "reality_public")
 REALITY_SHORT_ID_FILE = os.path.join(APP_DIR, "reality_short_id")
@@ -73,10 +74,10 @@ def sync_xray_config() -> None:
     ]
 
     reality_clients = [
-        {"id": c["xray_uuid"], "flow": "xtls-rprx-vision"} for c in enabled_clients
+        {"id": c["xray_uuid"], "email": c["xray_uuid"], "flow": "xtls-rprx-vision"} for c in enabled_clients
     ]
-    ws_clients = [{"id": c["xray_uuid"]} for c in enabled_clients]
-    xhttp_clients = [{"id": c["xray_uuid"]} for c in enabled_clients]
+    ws_clients = [{"id": c["xray_uuid"], "email": c["xray_uuid"]} for c in enabled_clients]
+    xhttp_clients = [{"id": c["xray_uuid"], "email": c["xray_uuid"]} for c in enabled_clients]
 
     reality_settings = dict(existing_reality)
     if not reality_settings.get("privateKey"):
@@ -116,6 +117,8 @@ def sync_xray_config() -> None:
 
     config = {
         "log": {"loglevel": "warning"},
+        "api": {"tag": "api", "services": ["StatsService", "HandlerService"]},
+        "stats": {},
         "inbounds": [
             {
                 "port": XRAY_REALITY_PORT, "protocol": "vless",
@@ -144,14 +147,24 @@ def sync_xray_config() -> None:
                 },
                 "sniffing": {"enabled": True, "destOverride": ["http", "tls"]},
             },
+            {
+                "tag": "api",
+                "port": XRAY_API_PORT, "listen": "127.0.0.1",
+                "protocol": "dokodemo-door",
+                "settings": {"address": "127.0.0.1"},
+            },
         ],
         "outbounds": [
             {"protocol": "freedom", "tag": "direct", "settings": {"domainStrategy": "UseIP"}},
+            {"protocol": "freedom", "tag": "api"},
             {"protocol": "blackhole", "tag": "block"},
         ],
         "routing": {
             "domainStrategy": "IPIfNonMatch",
-            "rules": [{"type": "field", "outboundTag": "direct", "network": "tcp,udp"}],
+            "rules": [
+                {"type": "field", "inboundTag": ["api"], "outboundTag": "api"},
+                {"type": "field", "outboundTag": "direct", "network": "tcp,udp"},
+            ],
         },
     }
 
@@ -199,9 +212,36 @@ def build_xray_link(client_id: str, proto: str) -> str:
 def post_restart_xray():
     sync_xray_config()
 
+_ONLINE_UUIDS: List[str] = []
+_ONLINE_UUIDS_TS: float = 0
+
+def get_online_uuids() -> List[str]:
+    global _ONLINE_UUIDS, _ONLINE_UUIDS_TS
+    now = time.time()
+    if now - _ONLINE_UUIDS_TS < 15:
+        return _ONLINE_UUIDS
+    out = try_run_cmd(["xray", "api", "statsgetallonlineusers", "--server", f"127.0.0.1:{XRAY_API_PORT}"], timeout=5)
+    if out:
+        try:
+            data = json.loads(out)
+            if isinstance(data, dict):
+                _ONLINE_UUIDS = data.get("users", [])
+            elif isinstance(data, list):
+                _ONLINE_UUIDS = data
+            else:
+                _ONLINE_UUIDS = []
+        except json.JSONDecodeError:
+            _ONLINE_UUIDS = [line.strip() for line in out.splitlines() if line.strip()]
+    else:
+        _ONLINE_UUIDS = []
+    _ONLINE_UUIDS_TS = now
+    return _ONLINE_UUIDS
+
 def _build_peer_entry(client: Dict[str, Any], client_id: str) -> Dict[str, Any]:
     name = client.get("name", client_id)
     address = client.get("address", "")
+    uid = client.get("xray_uuid", "")
+    online = uid in get_online_uuids()
     return {
         "id": client_id[:12],
         "name": name,
@@ -210,15 +250,15 @@ def _build_peer_entry(client: Dict[str, Any], client_id: str) -> Dict[str, Any]:
         "enabled": bool(client.get("enabled", True)),
         "protected": bool(client.get("protected", False)),
         "role": client.get("role", "user"),
-        "xray_uuid": client.get("xray_uuid", ""),
+        "xray_uuid": uid,
         "public_key": "",
         "public_key_short": "",
         "endpoint": None,
         "allowed_ips": "",
-        "latest_handshake": 0,
-        "latest_handshake_text": "never",
-        "online": False,
-        "is_active_now": False,
+        "latest_handshake": int(time.time()) if online else 0,
+        "latest_handshake_text": handshake_to_text(int(time.time())) if online else "never",
+        "online": online,
+        "is_active_now": online,
         "transfer_rx_bytes": 0, "transfer_tx_bytes": 0, "transfer_total_bytes": 0,
         "transfer_rx_human": bytes_to_human(0), "transfer_tx_human": bytes_to_human(0),
         "transfer_total_human": bytes_to_human(0),
@@ -531,6 +571,8 @@ def dashboard(x_api_token: Optional[str] = Header(default=None)) -> Dict[str, An
     peers_list = [_build_peer_entry(c, cid) for cid, c in clients.items() if isinstance(c, dict)]
     total_rx = sum(p["transfer_rx_bytes"] for p in peers_list)
     total_tx = sum(p["transfer_tx_bytes"] for p in peers_list)
+    online_uuids = get_online_uuids()
+    online_count = sum(1 for c in clients.values() if isinstance(c, dict) and c.get("xray_uuid", "") in online_uuids)
     return {
         "variant": "xray",
         "hostname": _get_hostname(),
@@ -542,7 +584,7 @@ def dashboard(x_api_token: Optional[str] = Header(default=None)) -> Dict[str, An
         "wireguard": {
             "interface": "xray",
             "peer_count": len(peers_list),
-            "online_peer_count": 0,
+            "online_peer_count": online_count,
             "online_threshold_seconds": 1800,
             "total_rx_bytes": total_rx, "total_tx_bytes": total_tx,
             "total_traffic_bytes": total_rx + total_tx,
