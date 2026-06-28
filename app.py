@@ -194,6 +194,8 @@ _XRAY_TRAFFIC_CACHE_TS: float = 0
 _XRAY_TRAFFIC_ACCUM: Dict[str, Dict[str, int]] = {}
 _XRAY_TRAFFIC_LOCK = threading.Lock()
 XRAY_API_PORT = int(os.environ.get("XRAY_API_PORT", "62789"))
+_XRAY_SYNC_PENDING = False
+_XRAY_SYNC_LOCK = threading.Lock()
 CPU_CACHE: Dict[str, Any] = {"value": None, "ts": 0}
 CPU_CACHE_LOCK = threading.Lock()
 CPU_LAST_SAMPLE = None
@@ -1406,7 +1408,7 @@ def disable_peer(client_id: str) -> Dict[str, Any]:
     )
 
     if WG_VARIANT == "xray":
-        sync_xray_config()
+        sync_xray_config_background()
 
     return {
         "disabled": True,
@@ -1477,7 +1479,7 @@ def enable_peer(client_id: str) -> Dict[str, Any]:
     )
 
     if WG_VARIANT == "xray":
-        sync_xray_config()
+        sync_xray_config_background()
 
     return {
         "enabled": True,
@@ -1606,7 +1608,7 @@ def create_peer(name: str) -> Dict[str, Any]:
     config_changed(f"peer-created:{name}")
 
     if WG_VARIANT == "xray":
-        sync_xray_config()
+        sync_xray_config_background()
 
     return {
         "created": True,
@@ -1660,7 +1662,7 @@ def delete_peer(client_id: str) -> Dict[str, Any]:
     config_changed(f"peer-deleted:{name}")
 
     if WG_VARIANT == "xray":
-        sync_xray_config()
+        sync_xray_config_background()
 
     return {
         "deleted": True,
@@ -1703,6 +1705,24 @@ def build_xray_links(client_id: str) -> Dict[str, str]:
     return links
 
 XRAY_JSON = "/data/xray.json"
+
+def sync_xray_config_background() -> None:
+    global _XRAY_SYNC_PENDING
+    with _XRAY_SYNC_LOCK:
+        if _XRAY_SYNC_PENDING:
+            return
+        _XRAY_SYNC_PENDING = True
+    threading.Thread(target=_sync_xray_config_locked, daemon=True).start()
+
+def _sync_xray_config_locked() -> None:
+    global _XRAY_SYNC_PENDING
+    try:
+        sync_xray_config()
+    except Exception as e:
+        print(f"[xray] sync_xray_config error: {e}", flush=True)
+    finally:
+        with _XRAY_SYNC_LOCK:
+            _XRAY_SYNC_PENDING = False
 
 def sync_xray_config():
     if WG_VARIANT != "xray":
