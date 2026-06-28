@@ -50,9 +50,20 @@ def atomic_json_write(path: str, data, backup: bool = False, **json_kwargs):
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2, **json_kwargs)
         os.replace(tmp, path)
+        if backup:
+            _cleanup_old_baks(path)
     except Exception:
         try_run_cmd(["rm", "-f", tmp])
         raise
+
+def _cleanup_old_baks(path: str, keep: int = 3) -> None:
+    import glob
+    baks = sorted(glob.glob(str(path) + ".bak-*"), key=os.path.getmtime)
+    for old in baks[:-keep]:
+        try:
+            os.remove(old)
+        except OSError:
+            pass
 
 def run_cmd(cmd: List[str], timeout: int = 8, input_text: Optional[str] = None) -> str:
     try:

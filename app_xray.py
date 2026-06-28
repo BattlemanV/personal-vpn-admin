@@ -57,6 +57,8 @@ def _read_short_id() -> str:
 CLIENTS_LOCK = threading.Lock()
 _XRAY_SYNC_LOCK = threading.Lock()
 _XRAY_SYNC_PENDING = False
+_ADMIN_IPS_CACHE: Dict[str, Any] = {"ips": set(), "ts": 0}
+_ADMIN_IPS_CACHE_TTL = 5
 
 def sync_xray_config_background() -> None:
     global _XRAY_SYNC_PENDING
@@ -198,14 +200,16 @@ def sync_xray_config() -> None:
     atomic_json_write(XRAY_CONFIG, config)
     try_run_cmd(["pkill", "-x", "xray"], timeout=5)
     time.sleep(0.3)
-    subprocess.Popen(
-        ["nohup", "xray", "run", "-c", XRAY_CONFIG],
-        stdout=open("/tmp/xray.log", "a"), stderr=subprocess.STDOUT,
-    )
+    with open("/tmp/xray.log", "a") as log_f:
+        subprocess.Popen(
+            ["nohup", "xray", "run", "-c", XRAY_CONFIG],
+            stdout=log_f, stderr=subprocess.STDOUT,
+        )
 
-def build_xray_link(client_id: str, proto: str) -> str:
-    item = get_client(client_id)
-    client = item["client"]
+def build_xray_link(client_id: str, proto: str, client: Optional[Dict[str, Any]] = None) -> str:
+    if client is None:
+        item = get_client(client_id)
+        client = item["client"]
     uid = client.get("xray_uuid", "")
     name = client.get("name", client_id)
     if not uid:
@@ -243,13 +247,18 @@ def post_restart_xray():
 _TRAFFIC_CACHE: Dict[str, Dict[str, int]] = {}
 _TRAFFIC_CACHE_TS: float = 0
 _TRAFFIC_ACCUM: Dict[str, Dict[str, int]] = {}
+_TRAFFIC_LOCK = threading.Lock()
+_LAST_CLEANUP_DAY: str = ""
 
 def get_xray_traffic() -> Dict[str, Dict[str, int]]:
     global _TRAFFIC_CACHE, _TRAFFIC_CACHE_TS, _TRAFFIC_ACCUM
     now = time.time()
     if now - _TRAFFIC_CACHE_TS < 30:
         return _TRAFFIC_CACHE
-    _TRAFFIC_CACHE_TS = now  # блокируем повторные вызовы на 30с даже если xray не готов
+    with _TRAFFIC_LOCK:
+        if now - _TRAFFIC_CACHE_TS < 30:
+            return _TRAFFIC_CACHE
+        _TRAFFIC_CACHE_TS = now
     result: Dict[str, Dict[str, int]] = {}
     out = try_run_cmd(["xray", "api", "statsquery", "--server", f"127.0.0.1:{XRAY_API_PORT}", "-pattern", "user>>>"], timeout=5)
     if out:
@@ -272,14 +281,15 @@ def get_xray_traffic() -> Dict[str, Dict[str, int]]:
                         result[email][direction] = max(result[email][direction], value)
         except json.JSONDecodeError:
             pass
-    for email, data in result.items():
-        prev = _TRAFFIC_ACCUM.get(email, {"downlink": 0, "uplink": 0})
-        _TRAFFIC_ACCUM[email] = {
-            "downlink": max(prev["downlink"], data["downlink"]),
-            "uplink": max(prev["uplink"], data["uplink"]),
-        }
-    _TRAFFIC_CACHE = dict(_TRAFFIC_ACCUM)
-    _TRAFFIC_CACHE_TS = now
+    with _TRAFFIC_LOCK:
+        for email, data in result.items():
+            prev = _TRAFFIC_ACCUM.get(email, {"downlink": 0, "uplink": 0})
+            _TRAFFIC_ACCUM[email] = {
+                "downlink": max(prev["downlink"], data["downlink"]),
+                "uplink": max(prev["uplink"], data["uplink"]),
+            }
+        _TRAFFIC_CACHE = dict(_TRAFFIC_ACCUM)
+        _TRAFFIC_CACHE_TS = now
     return _TRAFFIC_CACHE
 
 def init_traffic_db() -> None:
@@ -337,33 +347,42 @@ def cleanup_traffic_db(db) -> None:
     db.execute("DELETE FROM traffic_totals WHERE period_type = 'day' AND period_key < ?", (cutoff_day,))
     db.execute("DELETE FROM online_totals WHERE day_key < ?", (cutoff_day,))
 
-def get_period_traffic(peer_key: str, rx: int, tx: int, online: bool = False) -> Dict[str, Any]:
+def get_period_traffic(peer_key: str, rx: int, tx: int, online: bool = False, db=None) -> Dict[str, Any]:
+    global _LAST_CLEANUP_DAY
     today = today_key(); week = week_key(); month = month_key(); now_ts = int(time.time())
-    with sqlite3.connect(TRAFFIC_DB_FILE, timeout=10) as db:
-        row = db.execute("SELECT last_rx, last_tx FROM peer_counters WHERE public_key = ?", (peer_key,)).fetchone()
-        ignore_zero_offline = bool(row) and rx == 0 and tx == 0 and not online
-        if row is None:
-            rx_delta = 0; tx_delta = 0
-            db.execute("INSERT INTO peer_counters (public_key, last_rx, last_tx, updated_ts) VALUES (?, ?, ?, ?)", (peer_key, rx, tx, now_ts))
-        elif ignore_zero_offline: rx_delta = 0; tx_delta = 0
-        else:
-            last_rx = int(row[0] or 0); last_tx = int(row[1] or 0)
-            rx_delta = rx - last_rx if rx >= last_rx else rx; tx_delta = tx - last_tx if tx >= last_tx else tx
-            rx_delta = max(0, rx_delta); tx_delta = max(0, tx_delta)
-            db.execute("UPDATE peer_counters SET last_rx = ?, last_tx = ?, updated_ts = ? WHERE public_key = ?", (rx, tx, now_ts, peer_key))
-        if rx_delta or tx_delta:
-            add_traffic_total(db, peer_key, "day", today, rx_delta, tx_delta)
-            add_traffic_total(db, peer_key, "hour", time.strftime("%Y-%m-%d-%H", time.gmtime()), rx_delta, tx_delta)
-            add_traffic_total(db, peer_key, "week", week, rx_delta, tx_delta)
-            add_traffic_total(db, peer_key, "month", month, rx_delta, tx_delta)
-            add_traffic_total(db, peer_key, "total", "all", rx_delta, tx_delta)
-        online_today_seconds = update_online_total(db, peer_key, today, online, now_ts)
-        day_t = read_traffic_total(db, peer_key, "day", today)
-        week_total = read_rolling_traffic(db, peer_key, 7)
-        month_total = read_traffic_total(db, peer_key, "month", month)
-        year_total = read_rolling_traffic(db, peer_key, 365)
-        total = read_traffic_total(db, peer_key, "total", "all")
+    if db is None:
+        with sqlite3.connect(TRAFFIC_DB_FILE, timeout=10) as conn:
+            return _get_period_traffic_inner(conn, peer_key, rx, tx, online, today, week, month, now_ts)
+    return _get_period_traffic_inner(db, peer_key, rx, tx, online, today, week, month, now_ts)
+
+def _get_period_traffic_inner(db, peer_key: str, rx: int, tx: int, online: bool, today: str, week: str, month: str, now_ts: int) -> Dict[str, Any]:
+    global _LAST_CLEANUP_DAY
+    row = db.execute("SELECT last_rx, last_tx FROM peer_counters WHERE public_key = ?", (peer_key,)).fetchone()
+    ignore_zero_offline = bool(row) and rx == 0 and tx == 0 and not online
+    if row is None:
+        rx_delta = 0; tx_delta = 0
+        db.execute("INSERT INTO peer_counters (public_key, last_rx, last_tx, updated_ts) VALUES (?, ?, ?, ?)", (peer_key, rx, tx, now_ts))
+    elif ignore_zero_offline: rx_delta = 0; tx_delta = 0
+    else:
+        last_rx = int(row[0] or 0); last_tx = int(row[1] or 0)
+        rx_delta = rx - last_rx if rx >= last_rx else rx; tx_delta = tx - last_tx if tx >= last_tx else tx
+        rx_delta = max(0, rx_delta); tx_delta = max(0, tx_delta)
+        db.execute("UPDATE peer_counters SET last_rx = ?, last_tx = ?, updated_ts = ? WHERE public_key = ?", (rx, tx, now_ts, peer_key))
+    if rx_delta or tx_delta:
+        add_traffic_total(db, peer_key, "day", today, rx_delta, tx_delta)
+        add_traffic_total(db, peer_key, "hour", time.strftime("%Y-%m-%d-%H", time.gmtime()), rx_delta, tx_delta)
+        add_traffic_total(db, peer_key, "week", week, rx_delta, tx_delta)
+        add_traffic_total(db, peer_key, "month", month, rx_delta, tx_delta)
+        add_traffic_total(db, peer_key, "total", "all", rx_delta, tx_delta)
+    online_today_seconds = update_online_total(db, peer_key, today, online, now_ts)
+    day_t = read_traffic_total(db, peer_key, "day", today)
+    week_total = read_rolling_traffic(db, peer_key, 7)
+    month_total = read_traffic_total(db, peer_key, "month", month)
+    year_total = read_rolling_traffic(db, peer_key, 365)
+    total = read_traffic_total(db, peer_key, "total", "all")
+    if _LAST_CLEANUP_DAY != today:
         cleanup_traffic_db(db)
+        _LAST_CLEANUP_DAY = today
     return {
         "today_rx_bytes": day_t["rx"], "today_tx_bytes": day_t["tx"], "today_total_bytes": day_t["rx"] + day_t["tx"],
         "today_rx_human": bytes_to_human(day_t["rx"]), "today_tx_human": bytes_to_human(day_t["tx"]), "today_total_human": bytes_to_human(day_t["rx"] + day_t["tx"]),
@@ -378,7 +397,7 @@ def get_period_traffic(peer_key: str, rx: int, tx: int, online: bool = False) ->
         "online_today_seconds": online_today_seconds, "online_today_human": seconds_to_human(online_today_seconds),
     }
 
-def _build_peer_entry(client: Dict[str, Any], client_id: str) -> Dict[str, Any]:
+def _build_peer_entry(client: Dict[str, Any], client_id: str, db=None) -> Dict[str, Any]:
     name = client.get("name", client_id)
     address = client.get("address", "")
     uid = client.get("xray_uuid", "")
@@ -387,7 +406,7 @@ def _build_peer_entry(client: Dict[str, Any], client_id: str) -> Dict[str, Any]:
     dl = peer_traffic.get("downlink", 0)
     ul = peer_traffic.get("uplink", 0)
     total = dl + ul
-    period = get_period_traffic(uid, ul, dl, False) if uid else {}
+    period = get_period_traffic(uid, ul, dl, False, db) if uid else {}
     now = int(time.time())
     has_traffic = bool(total) or bool(period.get("today_total_bytes"))
     last_seen = save_peer_last_seen(uid, now) if has_traffic else 0
@@ -449,13 +468,19 @@ async def auth_middleware(request: Request, call_next):
     client_ip = request.client.host
     if client_ip == "10.8.0.1":
         return await call_next(request)
-    try:
-        data = read_clients_data()
-        for c, client in data.get("clients", {}).items():
-            if client.get("role") == "admin" and client.get("address") == client_ip:
-                return await call_next(request)
-    except Exception:
-        pass
+    now = time.time()
+    if now - _ADMIN_IPS_CACHE["ts"] > _ADMIN_IPS_CACHE_TTL:
+        try:
+            data = read_clients_data()
+            _ADMIN_IPS_CACHE["ips"] = {
+                c.get("address") for c in data.get("clients", {}).values()
+                if isinstance(c, dict) and c.get("role") == "admin"
+            }
+            _ADMIN_IPS_CACHE["ts"] = now
+        except Exception:
+            pass
+    if client_ip in _ADMIN_IPS_CACHE["ips"]:
+        return await call_next(request)
     x_api_token = request.headers.get("x-api-token")
     if x_api_token:
         try:
@@ -723,7 +748,8 @@ def maintenance_reboot_server(
 def dashboard(x_api_token: Optional[str] = Header(default=None)) -> Dict[str, Any]:
     data = read_clients_data()
     clients = data.get("clients", {})
-    peers_list = [_build_peer_entry(c, cid) for cid, c in clients.items() if isinstance(c, dict)]
+    with sqlite3.connect(TRAFFIC_DB_FILE, timeout=10) as db:
+        peers_list = [_build_peer_entry(c, cid, db) for cid, c in clients.items() if isinstance(c, dict)]
     total_rx = sum(p["transfer_rx_bytes"] for p in peers_list)
     total_tx = sum(p["transfer_tx_bytes"] for p in peers_list)
     vpn_today = sum(p.get("today_total_bytes", 0) for p in peers_list)
@@ -747,6 +773,7 @@ def dashboard(x_api_token: Optional[str] = Header(default=None)) -> Dict[str, An
     if best:
         top_user_now.update(best)
         top_user_now["ts"] = int(time.time())
+    settings = read_settings()
     return {
         "variant": "xray",
         "hostname": _get_hostname(),
@@ -770,8 +797,8 @@ def dashboard(x_api_token: Optional[str] = Header(default=None)) -> Dict[str, An
             "vpn_today_human": bytes_to_human(vpn_today), "vpn_week_human": bytes_to_human(vpn_week),
             "vpn_month_human": bytes_to_human(vpn_month), "vpn_year_human": bytes_to_human(vpn_year),
             "vpn_saved_total_human": bytes_to_human(vpn_saved_total),
-            "traffic_warn_bytes": read_settings().get("traffic_warn_gb", 30) * 1024 * 1024 * 1024,
-            "timezone": read_settings().get("timezone", "auto"),
+            "traffic_warn_bytes": settings.get("traffic_warn_gb", 30) * 1024 * 1024 * 1024,
+            "timezone": settings.get("timezone", "auto"),
             "top_user_now": top_user_now,
             "online_peers": online_peers,
         },
@@ -781,11 +808,12 @@ def dashboard(x_api_token: Optional[str] = Header(default=None)) -> Dict[str, An
 def peers(x_api_token: Optional[str] = Header(default=None)) -> Dict[str, Any]:
     data = read_clients_data()
     clients = data.get("clients", {})
-    peers_list = [
-        _build_peer_entry(c, cid)
-        for cid, c in clients.items()
-        if isinstance(c, dict)
-    ]
+    with sqlite3.connect(TRAFFIC_DB_FILE, timeout=10) as db:
+        peers_list = [
+            _build_peer_entry(c, cid, db)
+            for cid, c in clients.items()
+            if isinstance(c, dict)
+        ]
     peers_list.sort(key=lambda p: p.get("ip") or "")
     online_count = sum(1 for p in peers_list if p["online"])
     best = None
@@ -945,11 +973,12 @@ def peer_set_role(
     role = str(payload.get("role", "")).strip()
     if role not in ("admin", "user"):
         raise HTTPException(status_code=400, detail="Role must be 'admin' or 'user'")
-    item = get_client(client_id)
-    data = item["data"]
-    client = item["client"]
-    client["role"] = role
-    atomic_json_write(CLIENTS_FILE, data, backup=True)
+    with CLIENTS_LOCK:
+        item = get_client(client_id)
+        data = item["data"]
+        client = item["client"]
+        client["role"] = role
+        atomic_json_write(CLIENTS_FILE, data, backup=True)
     log_activity("role_change", client.get("name", client_id), client_id,
                  client.get("address", ""), {"role": role})
     config_changed(f"peer-role:{client_id}:{role}")
@@ -962,12 +991,13 @@ def peer_protect(
     x_api_token: Optional[str] = Header(default=None),
 ) -> Dict[str, Any]:
     protected = bool(payload.get("protected", True))
-    item = get_client(client_id)
-    data = item["data"]
-    client = item["client"]
-    name = client.get("name", client_id)
-    client["protected"] = protected
-    atomic_json_write(CLIENTS_FILE, data, backup=True)
+    with CLIENTS_LOCK:
+        item = get_client(client_id)
+        data = item["data"]
+        client = item["client"]
+        name = client.get("name", client_id)
+        client["protected"] = protected
+        atomic_json_write(CLIENTS_FILE, data, backup=True)
     log_activity("protect" if protected else "unprotect", name, client_id,
                  client.get("address", ""), {"protected": protected})
     return {"ok": True, "client_id": client_id, "protected": protected}
@@ -996,8 +1026,6 @@ def peer_qr(
     token: Optional[str] = Query(default=None),
 ):
     link = build_xray_link(client_id, proto)
-    if not link:
-        raise HTTPException(400, "No config for this protocol")
     img = qrcode.make(link)
     buffer = io.BytesIO()
     img.save(buffer, format="PNG")
@@ -1106,9 +1134,9 @@ def xray_links(x_api_token: Optional[str] = Header(default=None)) -> Dict[str, A
         links[cid] = {
             "name": name,
             "uuid": uid,
-            "reality": build_xray_link(cid, "reality"),
-            "ws": build_xray_link(cid, "ws"),
-            "xhttp": build_xray_link(cid, "xhttp"),
+            "reality": build_xray_link(cid, "reality", client),
+            "ws": build_xray_link(cid, "ws", client),
+            "xhttp": build_xray_link(cid, "xhttp", client),
         }
     return {"links": links}
 
@@ -1140,35 +1168,20 @@ def diagnostics(x_api_token: Optional[str] = Header(default=None)) -> Dict[str, 
         health["healthy_since"] = now
     _write_health(health)
     days_ok = _days_since(health.get("healthy_since")) if health.get("healthy_since") else 0
-    cpu_pct = 0.0
     try:
-        with open("/proc/stat") as f:
-            parts = f.readline().strip().split()
-        if parts and parts[0] == "cpu" and len(parts) >= 5:
-            user, nice, system, idle = int(parts[1]), int(parts[2]), int(parts[3]), int(parts[4])
-            iowait = int(parts[5]) if len(parts) > 5 else 0
-            irq = int(parts[6]) if len(parts) > 6 else 0
-            softirq = int(parts[7]) if len(parts) > 7 else 0
-            steal = int(parts[8]) if len(parts) > 8 else 0
-            total = user + nice + system + idle + iowait + irq + softirq + steal
-            if total > idle:
-                cpu_pct = round((total - idle) / total * 100, 1)
+        cpu = get_cpu_usage()
+        cpu_pct = cpu.get("percent", 0.0)
     except Exception:
-        pass
-    mem_pct = 0.0
-    mem_total = 0
-    mem_avail = 0
+        cpu_pct = 0.0
     try:
-        with open("/proc/meminfo") as f:
-            for line in f:
-                if line.startswith("MemTotal:"):
-                    mem_total = int(line.split()[1])
-                elif line.startswith("MemAvailable:"):
-                    mem_avail = int(line.split()[1])
-        if mem_total:
-            mem_pct = round((1 - mem_avail / mem_total) * 100, 1)
+        mem = get_memory()
+        mem_pct = mem.get("used_percent", 0.0)
+        mem_total = mem.get("total_bytes", 0)
+        mem_avail = mem.get("available_bytes", 0)
     except Exception:
-        pass
+        mem_pct = 0.0
+        mem_total = 0
+        mem_avail = 0
     disk_pct = 0.0
     disk_total = 0
     disk_used = 0
