@@ -22,6 +22,15 @@ import tempfile
 from contextlib import asynccontextmanager
 
 import tarfile
+import glob
+
+def _cleanup_old_baks(path: str, keep: int = 3) -> None:
+    baks = sorted(glob.glob(str(path) + ".bak-*"), key=os.path.getmtime)
+    for old in baks[:-keep]:
+        try:
+            os.remove(old)
+        except OSError:
+            pass
 
 def atomic_json_write(path: str, data, backup: bool = False, **json_kwargs):
     tmp = path + ".tmp"
@@ -34,6 +43,7 @@ def atomic_json_write(path: str, data, backup: bool = False, **json_kwargs):
     except Exception:
         try_run_cmd(["rm", "-f", tmp])
         raise
+    _cleanup_old_baks(path)
 
 def _create_backup() -> bool:
     """Core backup logic, no auth or lock check."""
@@ -197,6 +207,7 @@ XRAY_API_PORT = int(os.environ.get("XRAY_API_PORT", "62789"))
 _XRAY_SYNC_PENDING = False
 _XRAY_SYNC_REPEAT = False
 _XRAY_SYNC_LOCK = threading.Lock()
+CLIENTS_LOCK = threading.Lock()
 _LAST_CLEANUP_DAY = ""
 NAME_RE = re.compile(r"^[\w\s\-\.а-яА-ЯёЁ]+$")
 RATE_RE = re.compile(r"^\d+(kbit|mbit|gbit|kbps|mbps|gbps)$")
@@ -813,17 +824,17 @@ def get_xray_traffic() -> Dict[str, Dict[str, int]]:
     with _XRAY_TRAFFIC_LOCK:
         if now - _XRAY_TRAFFIC_CACHE_TS < 15:
             return _XRAY_TRAFFIC_CACHE
-        _XRAY_TRAFFIC_CACHE_TS = now
     result: Dict[str, Dict[str, int]] = {}
     out = try_run_cmd(["xray", "api", "statsquery", "--server", f"127.0.0.1:{XRAY_API_PORT}", "-pattern", "user>>>"], timeout=5)
     if out:
         try:
             data = json.loads(out)
-            entries = []
             if isinstance(data, dict):
                 entries = data.get("stat", [])
             elif isinstance(data, list):
                 entries = data
+            else:
+                entries = []
             for entry in entries:
                 if isinstance(entry, dict):
                     name = entry.get("name", "")
@@ -1375,24 +1386,25 @@ def disable_peer(client_id: str) -> Dict[str, Any]:
     if not check["allowed"]:
         raise HTTPException(status_code=403, detail=check)
 
-    item = get_client(client_id)
-    data = item["data"]
-    client = item["client"]
+    with CLIENTS_LOCK:
+        item = get_client(client_id)
+        data = item["data"]
+        client = item["client"]
 
-    public_key = client.get("publicKey")
-    name = client.get("name", client_id)
-    address = client.get("address")
+        public_key = client.get("publicKey")
+        name = client.get("name", client_id)
+        address = client.get("address")
 
-    if not public_key:
-        raise HTTPException(status_code=500, detail="Client publicKey not found")
+        if not public_key:
+            raise HTTPException(status_code=500, detail="Client publicKey not found")
 
-    backup_path = f"{CLIENTS_FILE}.bak-{int(time.time())}"
-    if os.path.exists(CLIENTS_FILE):
-        shutil.copy2(CLIENTS_FILE, backup_path)
+        backup_path = f"{CLIENTS_FILE}.bak-{int(time.time())}"
+        if os.path.exists(CLIENTS_FILE):
+            shutil.copy2(CLIENTS_FILE, backup_path)
 
-    client["enabled"] = False
+        client["enabled"] = False
 
-    atomic_json_write(CLIENTS_FILE, data, backup=True)
+        atomic_json_write(CLIENTS_FILE, data, backup=True)
 
     try:
         cmd = ["wg", "set", WG_INTERFACE, "peer", public_key, "remove"]
@@ -1430,29 +1442,30 @@ def disable_peer(client_id: str) -> Dict[str, Any]:
     }
 
 def enable_peer(client_id: str) -> Dict[str, Any]:
-    item = get_client(client_id)
-    data = item["data"]
-    client = item["client"]
+    with CLIENTS_LOCK:
+        item = get_client(client_id)
+        data = item["data"]
+        client = item["client"]
 
-    name = client.get("name", client_id)
-    address = client.get("address")
-    public_key = client.get("publicKey")
-    preshared_key = client.get("preSharedKey")
+        name = client.get("name", client_id)
+        address = client.get("address")
+        public_key = client.get("publicKey")
+        preshared_key = client.get("preSharedKey")
 
-    if not address:
-        raise HTTPException(status_code=500, detail="Client address not found")
-    if not public_key:
-        raise HTTPException(status_code=500, detail="Client publicKey not found")
-    if not preshared_key:
-        raise HTTPException(status_code=500, detail="Client preSharedKey not found")
+        if not address:
+            raise HTTPException(status_code=500, detail="Client address not found")
+        if not public_key:
+            raise HTTPException(status_code=500, detail="Client publicKey not found")
+        if not preshared_key:
+            raise HTTPException(status_code=500, detail="Client preSharedKey not found")
 
-    backup_path = f"{CLIENTS_FILE}.bak-{int(time.time())}"
-    if os.path.exists(CLIENTS_FILE):
-        shutil.copy2(CLIENTS_FILE, backup_path)
+        backup_path = f"{CLIENTS_FILE}.bak-{int(time.time())}"
+        if os.path.exists(CLIENTS_FILE):
+            shutil.copy2(CLIENTS_FILE, backup_path)
 
-    client["enabled"] = True
+        client["enabled"] = True
 
-    atomic_json_write(CLIENTS_FILE, data, backup=True)
+        atomic_json_write(CLIENTS_FILE, data, backup=True)
 
     try:
         if IS_CONTAINER:
@@ -1537,15 +1550,7 @@ def create_peer(name: str) -> Dict[str, Any]:
     if not NAME_RE.match(name):
         raise HTTPException(status_code=400, detail="Client name contains invalid characters")
 
-    data = read_clients_data()
-    clients = data.setdefault("clients", {})
-
-    for client in clients.values():
-        if isinstance(client, dict) and client.get("name") == name:
-            raise HTTPException(status_code=409, detail=f"Client already exists: {name}")
-
     client_id = run_cmd(["cat", "/proc/sys/kernel/random/uuid"])
-    address = allocate_next_client_ip(data)
 
     if IS_CONTAINER:
         private_key = run_cmd(["wg", "genkey"])
@@ -1559,28 +1564,37 @@ def create_peer(name: str) -> Dict[str, Any]:
         preshared_key = run_cmd(["docker", "exec", WG_CONTAINER, "wg", "genpsk"])
 
     xray_uuid = str(uuid.uuid4())
-
-    backup_path = f"{CLIENTS_FILE}.bak-{int(time.time())}"
-    if os.path.exists(CLIENTS_FILE):
-        shutil.copy2(CLIENTS_FILE, backup_path)
-
     now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
-    clients[client_id] = {
-        "name": name,
-        "address": address,
-        "privateKey": private_key,
-        "publicKey": public_key,
-        "preSharedKey": preshared_key,
-        "xray_uuid": xray_uuid,
-        "createdAt": now,
-        "updatedAt": now,
-        "enabled": True,
-        "protected": False,
-        "role": "user",
-    }
+    with CLIENTS_LOCK:
+        data = read_clients_data()
+        clients = data.setdefault("clients", {})
 
-    atomic_json_write(CLIENTS_FILE, data, backup=True)
+        for client in clients.values():
+            if isinstance(client, dict) and client.get("name") == name:
+                raise HTTPException(status_code=409, detail=f"Client already exists: {name}")
+
+        address = allocate_next_client_ip(data)
+
+        backup_path = f"{CLIENTS_FILE}.bak-{int(time.time())}"
+        if os.path.exists(CLIENTS_FILE):
+            shutil.copy2(CLIENTS_FILE, backup_path)
+
+        clients[client_id] = {
+            "name": name,
+            "address": address,
+            "privateKey": private_key,
+            "publicKey": public_key,
+            "preSharedKey": preshared_key,
+            "xray_uuid": xray_uuid,
+            "createdAt": now,
+            "updatedAt": now,
+            "enabled": True,
+            "protected": False,
+            "role": "user",
+        }
+
+        atomic_json_write(CLIENTS_FILE, data, backup=True)
 
     try:
         if IS_CONTAINER:
@@ -1632,32 +1646,33 @@ def create_peer(name: str) -> Dict[str, Any]:
     }
 
 def delete_peer(client_id: str) -> Dict[str, Any]:
-    item = get_client(client_id)
-    data = item["data"]
-    client = item["client"]
+    with CLIENTS_LOCK:
+        item = get_client(client_id)
+        data = item["data"]
+        client = item["client"]
 
-    name = client.get("name", client_id)
-    address = client.get("address", "")
-    public_key = client.get("publicKey", "")
+        name = client.get("name", client_id)
+        address = client.get("address", "")
+        public_key = client.get("publicKey", "")
 
-    if client.get("protected", False):
-        log_activity(
-            action="delete_blocked",
-            peer=name,
-            client_id=client_id,
-            ip=address or "",
-            details={"reason": "Protected peer"},
-        )
-        raise HTTPException(status_code=403, detail="Protected peer")
+        if client.get("protected", False):
+            log_activity(
+                action="delete_blocked",
+                peer=name,
+                client_id=client_id,
+                ip=address or "",
+                details={"reason": "Protected peer"},
+            )
+            raise HTTPException(status_code=403, detail="Protected peer")
 
-    backup_path = f"{CLIENTS_FILE}.bak-{int(time.time())}"
-    if os.path.exists(CLIENTS_FILE):
-        shutil.copy2(CLIENTS_FILE, backup_path)
+        backup_path = f"{CLIENTS_FILE}.bak-{int(time.time())}"
+        if os.path.exists(CLIENTS_FILE):
+            shutil.copy2(CLIENTS_FILE, backup_path)
 
-    clients = data.get("clients", {})
-    clients.pop(client_id, None)
+        clients = data.get("clients", {})
+        clients.pop(client_id, None)
 
-    atomic_json_write(CLIENTS_FILE, data, backup=True)
+        atomic_json_write(CLIENTS_FILE, data, backup=True)
 
     if public_key:
         cmd = ["wg", "set", WG_INTERFACE, "peer", public_key, "remove"]
@@ -1699,16 +1714,19 @@ def get_client_xray_uuid(client_id: str) -> str:
         return open(uuid_file).read().strip()
     raise HTTPException(status_code=404, detail=f"Xray UUID not found for client: {client_id}")
 
-def build_xray_links(client_id: str) -> Dict[str, str]:
-    xray_uuid = get_client_xray_uuid(client_id)
+def build_xray_links(client_id: str, client: Optional[Dict] = None) -> Dict[str, str]:
+    if client is None:
+        xray_uuid = get_client_xray_uuid(client_id)
+    else:
+        xray_uuid = client.get("xray_uuid") or get_client_xray_uuid(client_id)
 
-    reality_pub_file = "/data/reality_public"
+    reality_pub_file = os.path.join(APP_DIR, "reality_public")
     pbk = ""
     if os.path.exists(reality_pub_file):
         pbk = open(reality_pub_file).read().strip()
 
     host = WG_HOST
-    short_id_file = "/data/reality_short_id"
+    short_id_file = os.path.join(APP_DIR, "reality_short_id")
     short_id = open(short_id_file).read().strip() if os.path.exists(short_id_file) else "d64cc26c"
 
     links = {
@@ -1730,19 +1748,20 @@ def sync_xray_config_background() -> None:
         _XRAY_SYNC_REPEAT = False
     threading.Thread(target=_sync_xray_config_locked, daemon=True).start()
 
-def _sync_xray_config_locked() -> None:
+def _sync_xray_config_locked(repeat_count: int = 0) -> None:
     global _XRAY_SYNC_PENDING, _XRAY_SYNC_REPEAT
     try:
         sync_xray_config()
     except Exception as e:
         print(f"[xray] sync_xray_config error: {e}", flush=True)
-    finally:
-        with _XRAY_SYNC_LOCK:
-            if _XRAY_SYNC_REPEAT:
-                _XRAY_SYNC_REPEAT = False
-                threading.Thread(target=_sync_xray_config_locked, daemon=True).start()
-                return
+
+    with _XRAY_SYNC_LOCK:
+        if _XRAY_SYNC_REPEAT and repeat_count < 5:
+            _XRAY_SYNC_REPEAT = False
+            threading.Thread(target=_sync_xray_config_locked, args=(repeat_count + 1,), daemon=True).start()
+        else:
             _XRAY_SYNC_PENDING = False
+            _XRAY_SYNC_REPEAT = False
 
 def sync_xray_config():
     if WG_VARIANT != "xray":
@@ -1750,23 +1769,24 @@ def sync_xray_config():
     if not os.path.exists(XRAY_JSON):
         return
     try:
-        data = read_clients_data()
-        clients = data.get("clients", {})
+        with CLIENTS_LOCK:
+            data = read_clients_data()
+            clients = data.get("clients", {})
 
-        enabled_uuids = []
-        changed = False
-        for client_id, client in list(clients.items()):
-            if not client.get("enabled", True):
-                continue
-            xray_uuid = client.get("xray_uuid")
-            if not xray_uuid:
-                xray_uuid = str(uuid.uuid4())
-                client["xray_uuid"] = xray_uuid
-                changed = True
-            enabled_uuids.append(xray_uuid)
+            enabled_uuids = []
+            changed = False
+            for client_id, client in list(clients.items()):
+                if not client.get("enabled", True):
+                    continue
+                xray_uuid = client.get("xray_uuid")
+                if not xray_uuid:
+                    xray_uuid = str(uuid.uuid4())
+                    client["xray_uuid"] = xray_uuid
+                    changed = True
+                enabled_uuids.append(xray_uuid)
 
-        if changed:
-            atomic_json_write(CLIENTS_FILE, data, backup=True)
+            if changed:
+                atomic_json_write(CLIENTS_FILE, data, backup=True)
 
         with open(XRAY_JSON) as f:
             xray_cfg = json.load(f)
@@ -1803,7 +1823,8 @@ def sync_xray_config():
 
 def build_client_config(client_id: str) -> str:
     if WG_VARIANT == "xray":
-        links = build_xray_links(client_id)
+        item = get_client(client_id)
+        links = build_xray_links(client_id, client=item["client"])
         return links.get("ws", "")
 
     item = get_client(client_id)
@@ -2288,12 +2309,13 @@ def peer_rename(client_id: str, payload: Dict[str, Any] = Body(default={}), x_ap
         raise HTTPException(status_code=400, detail="Name is required")
     if not NAME_RE.match(new_name):
         raise HTTPException(status_code=400, detail="Name contains invalid characters")
-    item = get_client(client_id)
-    data = item["data"]
-    client = item["client"]
-    old_name = client.get("name", client_id)
-    client["name"] = new_name
-    atomic_json_write(CLIENTS_FILE, data, backup=True)
+    with CLIENTS_LOCK:
+        item = get_client(client_id)
+        data = item["data"]
+        client = item["client"]
+        old_name = client.get("name", client_id)
+        client["name"] = new_name
+        atomic_json_write(CLIENTS_FILE, data, backup=True)
     log_activity(action="rename", peer=old_name, client_id=client_id, ip=client.get("address", ""), details={"old_name": old_name, "new_name": new_name})
     return {"ok": True, "client_id": client_id, "name": new_name}
 
@@ -2372,11 +2394,12 @@ def peer_set_role(client_id: str, payload: Dict[str, Any] = Body(default={}), x_
     role = str(payload.get("role", "")).strip()
     if role not in ("admin", "user"):
         raise HTTPException(status_code=400, detail="Role must be 'admin' or 'user'")
-    item = get_client(client_id)
-    data = item["data"]
-    client = item["client"]
-    client["role"] = role
-    atomic_json_write(CLIENTS_FILE, data, backup=True)
+    with CLIENTS_LOCK:
+        item = get_client(client_id)
+        data = item["data"]
+        client = item["client"]
+        client["role"] = role
+        atomic_json_write(CLIENTS_FILE, data, backup=True)
     log_activity(action="role_change", peer=client.get("name", client_id), client_id=client_id,
                  ip=client.get("address", ""), details={"role": role})
     config_changed(f"peer-role:{client_id}:{role}")
@@ -2386,12 +2409,13 @@ def peer_set_role(client_id: str, payload: Dict[str, Any] = Body(default={}), x_
 def peer_protect(client_id: str, payload: Dict[str, Any] = Body(default={}), x_api_token: Optional[str] = Header(default=None)) -> Dict[str, Any]:
 
     protected = bool(payload.get("protected", True))
-    item = get_client(client_id)
-    data = item["data"]
-    client = item["client"]
-    name = client.get("name", client_id)
-    client["protected"] = protected
-    atomic_json_write(CLIENTS_FILE, data, backup=True)
+    with CLIENTS_LOCK:
+        item = get_client(client_id)
+        data = item["data"]
+        client = item["client"]
+        name = client.get("name", client_id)
+        client["protected"] = protected
+        atomic_json_write(CLIENTS_FILE, data, backup=True)
     log_activity(
         action="protect" if protected else "unprotect",
         peer=name,
@@ -2405,7 +2429,8 @@ def peer_protect(client_id: str, payload: Dict[str, Any] = Body(default={}), x_a
 def peer_config(client_id: str, proto: Optional[str] = Query(default=None), x_api_token: Optional[str] = Header(default=None), token: Optional[str] = Query(default=None)):
 
     if WG_VARIANT == "xray" and proto:
-        links = build_xray_links(client_id)
+        item = get_client(client_id)
+        links = build_xray_links(client_id, client=item["client"])
         config = links.get(proto, "")
         fname = f"{client_id}-{proto}.txt"
     else:
@@ -2423,7 +2448,8 @@ def peer_config(client_id: str, proto: Optional[str] = Query(default=None), x_ap
 def peer_qr(client_id: str, proto: Optional[str] = Query(default=None), x_api_token: Optional[str] = Header(default=None), token: Optional[str] = Query(default=None)):
 
     if WG_VARIANT == "xray" and proto:
-        links = build_xray_links(client_id)
+        item = get_client(client_id)
+        links = build_xray_links(client_id, client=item["client"])
         config = links.get(proto, "")
     else:
         config = build_client_config(client_id)
@@ -2436,8 +2462,28 @@ def peer_qr(client_id: str, proto: Optional[str] = Query(default=None), x_api_to
 
 @app.get("/xray/links")
 def xray_links(x_api_token: Optional[str] = Header(default=None), token: Optional[str] = Query(default=None)):
-    links = build_xray_links("")
-    return links
+    uuid_file = os.path.join(APP_DIR, "uuid")
+    xray_uuid = ""
+    if os.path.exists(uuid_file):
+        xray_uuid = open(uuid_file).read().strip()
+    if not xray_uuid:
+        data = read_clients_data()
+        for client in data.get("clients", {}).values():
+            if client.get("xray_uuid"):
+                xray_uuid = client["xray_uuid"]
+                break
+    if not xray_uuid:
+        return {}
+    pbk_file = os.path.join(APP_DIR, "reality_public")
+    pbk = open(pbk_file).read().strip() if os.path.exists(pbk_file) else ""
+    host = WG_HOST
+    short_id_file = os.path.join(APP_DIR, "reality_short_id")
+    short_id = open(short_id_file).read().strip() if os.path.exists(short_id_file) else "d64cc26c"
+    return {
+        "reality": f"vless://{xray_uuid}@{host}:443?type=tcp&security=reality&pbk={pbk}&fp=chrome&sni=www.microsoft.com&sid={short_id}&flow=xtls-rprx-vision#REALITY",
+        "xhttp": f"vless://{xray_uuid}@{host}:8445?type=xhttp&path=%2Fvless&security=none#XHTTP",
+        "ws": f"vless://{xray_uuid}@{host}:8444?type=ws&path=%2Fvless&security=none#WS",
+    }
 
 @app.get("/peer/{client_id}/traffic/days")
 def peer_traffic_days(client_id: str, x_api_token: Optional[str] = Header(default=None)) -> Dict[str, Any]:
@@ -2657,7 +2703,7 @@ def get_top_user_now(peers: List[Dict[str, Any]]) -> Dict[str, Any]:
 @app.get("/dashboard")
 def dashboard(x_api_token: Optional[str] = Header(default=None)) -> Dict[str, Any]:
 
-
+    settings = read_settings()
     peer_data = parse_wg_dump(get_wg_dump())
     total_rx = sum(peer["transfer_rx_bytes"] for peer in peer_data["peers"])
     total_tx = sum(peer["transfer_tx_bytes"] for peer in peer_data["peers"])
@@ -2707,8 +2753,8 @@ def dashboard(x_api_token: Optional[str] = Header(default=None)) -> Dict[str, An
             "vpn_month_bytes": vpn_month,
             "vpn_year_bytes": vpn_year,
             "vpn_saved_total_bytes": vpn_saved_total,
-            "traffic_warn_bytes": read_settings().get("traffic_warn_gb", 30) * 1024 * 1024 * 1024,
-            "timezone": read_settings().get("timezone", "auto"),
+            "traffic_warn_bytes": settings.get("traffic_warn_gb", 30) * 1024 * 1024 * 1024,
+            "timezone": settings.get("timezone", "auto"),
 
             "vpn_today_human": bytes_to_human(vpn_today),
             "vpn_week_human": bytes_to_human(vpn_week),
